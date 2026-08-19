@@ -1,0 +1,921 @@
+---
+title: "DF 1km"
+author: "Spagnoli Chloé"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Objectif
+
+Ce script produit deux dataframes (`df_jour_1km`, `df_nuit_1km`) avec les colonnes : `date`, `source`, `id_station`, `nom`, `Ta`, `LST_pixel`, `LST_buffer`, `Ta_era5`, `RH975_era5`, `MNT`, `TPI`, `dist_ocean`, `dist_mer`, `SVF`, `LCZ`, `slope`, `aspect`, `NDVI`, `NDBI`, `MNDWI`, `albedo`, `longitude`, `latitude`, `diff_LST_Ta`.
+
+**Principe :**
+
+- Les prédicteurs **statiques** (MNT, TPI, dist_ocean, SVF, LCZ, slope, aspect) et les prédicteurs **par date** (NDVI, NDBI, MNDWI, albedo) sont calculés **une seule fois** (mêmes valeurs le jour ou la nuit), puis joints aux deux DF.
+- Seuls LST, Ta et ERA5 (Ta/RH) dépendent du jour/nuit -> gérés via un CONFIG différent pour chacun.
+- Le LST provient uniquement de Landsat (jour et nuit). Ajouter de nouvelles dates Landsat = déposer les `.tif` dans le dossier concerné et relancer le script, rien d'autre à modifier.
+- Ta est mesurée par 3 réseaux de stations : INMET, Prefecture, et Aéroport. Les stations sont détectées automatiquement à partir des fichiers présents dans `DOSSIER_AEROPORT` (id, nom, latitude, longitude lus directement dans chaque CSV) : ajouter un nouveau fichier station = rien à modifier dans le code.
+
+```{r libraries}
+library(terra)
+library(sf)
+library(dplyr)
+library(purrr)
+library(lubridate)
+```
+
+# Configuration générale
+
+Chemins à adapter selon l'environnement de travail.
+
+```{r config-crs}
+# ---- CRS de travail ----
+CRS_TRAVAIL <- 32623  # WGS 84 / UTM zone 23N
+```
+
+## Dossiers Ta (données stations brutes)
+
+```{r config-ta-dossiers}
+DOSSIER_INMET    <- "C:/Users/Spagnoli/Desktop/DATA/INMET/INMET_csv" #1 fichier par station, plsuieurs années dedans
+DOSSIER_PREF     <- "C:/Users/Spagnoli/Desktop/DATA/PREF/pref_csv" #1 fichier par station par an
+DOSSIER_AEROPORT <- "C:/Users/Spagnoli/Desktop/DATA/AEROPORT"  #1 fichier par station, plusieurs annees dedans
+```
+
+## Dossiers prédicteurs statiques (une seule version, invariante)
+
+```{r config-pred-statiques}
+DOSSIER_PRED <- "C:/Users/Spagnoli/Desktop/R/predicteurs"
+CHEMIN_MNT    <- file.path(DOSSIER_PRED, "MNT.tif")
+CHEMIN_TPI    <- file.path(DOSSIER_PRED, "TPI.tif")
+CHEMIN_OCEAN   <- file.path(DOSSIER_PRED, "dist_ocean.tif")
+CHEMIN_MER   <- file.path(DOSSIER_PRED, "dist_mer.tif")
+CHEMIN_SVF    <- file.path(DOSSIER_PRED, "SVF.tif")
+CHEMIN_LCZ    <- file.path(DOSSIER_PRED, "LCZ_30m.tif")
+CHEMIN_SLOPE  <- file.path(DOSSIER_PRED, "slope.tif")
+CHEMIN_ASPECT <- file.path(DOSSIER_PRED, "aspect.tif")
+```
+
+## Dossiers prédicteurs par date (NDVI/NDBI/MNDWI : 1 fichier par date)
+
+```{r config-pred-dates}
+DOSSIER_NDVI  <- "C:/Users/Spagnoli/Desktop/R/NDVI"
+DOSSIER_MNDWI <- "C:/Users/Spagnoli/Desktop/R/MNDWI"
+DOSSIER_NDBI  <- "C:/Users/Spagnoli/Desktop/R/NDBI"
+```
+
+## Albédo saisonnier (sec = mai-oct, humide = nov-avril)
+
+```{r config-albedo}
+CHEMIN_ALBEDO_SEC <- file.path(DOSSIER_PRED, "albedo_sec.tif")
+CHEMIN_ALBEDO_HUM <- file.path(DOSSIER_PRED, "albedo.tif")
+```
+
+## Chemins spécifiques JOUR
+
+```{r config-jour}
+DOSSIER_LST_JOUR_LANDSAT <- "C:/Users/Spagnoli/Desktop/R/predicteurs"
+PATTERN_LST_JOUR_LANDSAT <- "LC0[89]_L2SP_.*_LST_celsius\\.TIF$"
+DOSSIER_ERA5_TA_JOUR     <- "C:/Users/Spagnoli/Desktop/R/ERA5/era5_ta_jour"
+DOSSIER_ERA5_RH_JOUR     <- "C:/Users/Spagnoli/Desktop/R/ERA5/era5_rh_jour"
+HEURE_INMET_JOUR         <- 1300   # UTC (= 10h locale), aussi utilisé pour aéroport
+HEURE_PREF_JOUR          <- 1000   # heure locale
+```
+
+## Chemins spécifiques NUIT
+
+```{r config-nuit}
+DOSSIER_LST_NUIT_LANDSAT <- "C:/Users/Spagnoli/Desktop/R/predicteurs"
+PATTERN_LST_NUIT_LANDSAT <- "LC0[89]_L1GT_.*_LST_celsius\\.TIF$"
+DOSSIER_ERA5_TA_NUIT     <- "C:/Users/Spagnoli/Desktop/R/ERA5/era5_ta_nuit"
+DOSSIER_ERA5_RH_NUIT     <- "C:/Users/Spagnoli/Desktop/R/ERA5/era5_rh_nuit"
+HEURE_INMET_NUIT         <- 0100   # UTC (= 22h locale) -> aussi utilise pour aéroport
+HEURE_PREF_NUIT          <- 2200   # heure locale
+```
+
+## Fichiers de sortie
+
+```{r config-export}
+CHEMIN_EXPORT_JOUR <- "C:/Users/Spagnoli/Desktop/R/DF_jour1k_aeroport2"
+CHEMIN_EXPORT_NUIT <- "C:/Users/Spagnoli/Desktop/R/DF_nuit1k_aeroport2"
+```
+
+# Données stations (Préfecture + INMET + Aéroport)
+
+```{r stations-pref}
+df_pref <- data.frame(
+  source     = "Prefecture",
+  id_station = c("11", "16", "19", "20", "22", "28", "32"),
+  nom        = c("Iraja", "Jardim Botanico", "Barra/Riocentro",
+                 "Guaratiba", "Santa Cruz", "Alto da Boa Vista", "Sao Cristovao"),
+  latitude   = c( -22.82694, -22.97278, -22.97721,
+                  -23.05028, -22.90944, -22.96583, -22.89667),
+  longitude  = c( -43.33694, -43.22389, -43.39155,
+                  -43.59472, -43.68444, -43.27833, -43.22167)
+)
+
+df_inmet <- data.frame(
+  source     = "INMET",
+  id_station = c("A636", "A627", "A621", "A601", "A602", "A652"),
+  nom        = c("Rio - Jacarepagua", "Niteroi","Rio - Vila Militar",
+                 "Seropedica - Ecologia Agricola", "Rio - Marambaia", "Rio - Forte de Copacabana"),
+  latitude   = c(-22.93999999, -22.86749999, -22.86138888, -22.75777777,
+                 -23.05027777, -22.98833333),
+  longitude  = c(-43.40277777, -43.10194444, -43.41138888, -43.68472221,
+                 -43.59555555, -43.19055555)
+)
+```
+
+## Stations Aéroport (détection automatique)
+
+Chaque fichier `meteo_horaire_station_<id>_....csv` contient déjà id, nom, lat, lon dans ses colonnes 2 à 5 -> pas besoin de les saisir à la main, juste déposer le fichier.
+
+```{r stations-aeroport}
+fichiers_aeroport <- list.files(DOSSIER_AEROPORT,
+                                pattern = "^meteo_horaire_station_.*\\.csv$",
+                                full.names = TRUE, ignore.case = TRUE)
+
+df_aeroport <- map_dfr(fichiers_aeroport, function(f) {
+  premiere_ligne <- read.csv(f, header = TRUE, sep = ",", nrows = 1, stringsAsFactors = FALSE)
+  data.frame(
+    source     = "Aeroporto",
+    id_station = as.character(premiere_ligne[[2]]),
+    nom        = as.character(premiere_ligne[[3]]),
+    latitude   = as.numeric(premiere_ligne[[4]]),
+    longitude  = as.numeric(premiere_ligne[[5]])
+  )
+})
+cat("Nombre de stations Aeroport detectees :", nrow(df_aeroport), "\n")
+
+df_stations <- bind_rows(df_pref, df_inmet, df_aeroport)
+cat("Nombre total de stations :", nrow(df_stations), "\n")
+```
+
+## Table de correspondance et objets spatiaux
+
+```{r stations-correspondance-spatial}
+# Table de correspondance id_station -> prefixe des fichiers Prefecture
+correspondance_pref <- c(
+  "11" = "iraja", "16" = "jardim_botanico",
+  "19" = "riocentro", "20" = "guaratiba", "22" = "santa_cruz",
+  "28" = "alto_da_boa_vista", "32" = "sao_cristovao"
+)
+
+# Objet spatial stations, projete dans le CRS de travail
+stations_sf   <- st_as_sf(df_stations, coords = c("longitude", "latitude"), crs = 4326)
+stations_utm  <- st_transform(stations_sf, crs = CRS_TRAVAIL)
+stations_vect <- vect(stations_utm)
+buffer_vect_1km <- vect(st_buffer(stations_utm, dist = 1000))  # buffer 1km reutilise partout
+
+# Coordonnees lon/lat (arrondies) pour le DF final
+df_coords <- df_stations %>%
+  select(source, id_station, longitude, latitude) %>%
+  mutate(longitude = round(longitude, 6), latitude = round(latitude, 6))
+```
+
+# Grille de référence 1km (basée sur le MNT)
+
+```{r grille-reference}
+mnt_brut <- rast(CHEMIN_MNT)
+if (!same.crs(mnt_brut, paste0("EPSG:", CRS_TRAVAIL))) {
+  mnt_brut <- project(mnt_brut, paste0("EPSG:", CRS_TRAVAIL))
+}
+
+ext_r   <- ext(mnt_brut)
+new_ext <- ext(
+  floor(ext_r$xmin   / 1000) * 1000,
+  ceiling(ext_r$xmax / 1000) * 1000,
+  floor(ext_r$ymin   / 1000) * 1000,
+  ceiling(ext_r$ymax / 1000) * 1000
+)
+ref_1km <- rast(new_ext, res = 1000, crs = crs(mnt_brut))
+
+cat("Grille 1km : resolution", res(ref_1km)[1], "m, etendue",
+    sprintf("[%.0f, %.0f, %.0f, %.0f]", new_ext$xmin, new_ext$xmax, new_ext$ymin, new_ext$ymax), "\n")
+```
+
+# Fonctions utilitaires génériques
+
+```{r fonctions-utilitaires}
+# Reprojette + reechantillonne un raster (chemin ou objet SpatRaster) sur la grille 1km
+resample_1km <- function(chemin_ou_raster, method = "bilinear") {
+  r <- if (is.character(chemin_ou_raster)) rast(chemin_ou_raster) else chemin_ou_raster
+  if (!same.crs(r, ref_1km)) r <- project(r, crs(ref_1km))
+  resample(r, ref_1km, method = method)
+}
+
+# Extrait la valeur du pixel 1km sous chaque station (ordre = df_stations)
+extraire <- function(r_1km) {
+  round(terra::extract(r_1km, stations_vect)[, 2], 4)
+}
+
+# Extrait la moyenne du buffer 1km autour de chaque station
+extraire_buffer <- function(r_1km) {
+  round(terra::extract(r_1km, buffer_vect_1km, fun = mean, na.rm = TRUE)[, 2], 2)
+}
+
+# Comble les valeurs NA d'un vecteur extrait (une station en bordure du raster) en allant
+# chercher la valeur du pixel non-NA le plus proche du raster
+combler_NA_plus_proche <- function(vals, r_1km) {
+  idx_na <- which(is.na(vals))
+  if (length(idx_na) == 0) return(vals)
+  
+  # Toutes les cellules valides (non-NA) du raster, converties en points
+  cellules_valides <- terra::as.points(r_1km, na.rm = TRUE)
+  
+  for (i in idx_na) {
+    station_pt  <- stations_vect[i, ]
+    distances   <- terra::distance(cellules_valides, station_pt)
+    plus_proche <- which.min(distances)
+    valeur      <- terra::values(cellules_valides)[plus_proche, 1]
+    
+    cat("   [i] Station", df_stations$nom[i], ": pixel NA -> valeur du pixel le plus proche utilisee (",
+        round(valeur, 2), ") a", round(min(distances)), "m\n")
+    
+    vals[i] <- round(valeur, 4)
+  }
+  
+  vals
+}
+
+# Cherche dans un dossier le fichier dont le nom contient la date donnée (format YYYYMMDD)
+trouver_fichier_date <- function(dossier, date) {
+  fichiers <- list.files(dossier, pattern = "\\.tif$|\\.TIF$", full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(character(0))
+  dates_fichiers <- as.Date(
+    regmatches(basename(fichiers), regexpr("[0-9]{8}", basename(fichiers))),
+    format = "%Y%m%d"
+  )
+  fichiers[which(dates_fichiers == date)]
+}
+
+# Cherche dans un dossier le fichier dont la date est la plus proche de la date cible (utilise quand aucune 
+# correspondance n'existe -> les dates de nuit, puisque NDVI/NDBI/MNDWI ne peuvent etre 
+# calcules qu'a partir d'images de jour)
+trouver_fichier_proche <- function(dossier, date) {
+  fichiers <- list.files(dossier, pattern = "\\.tif$|\\.TIF$", full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(character(0))
+  
+  dates_fichiers <- as.Date(
+    regmatches(basename(fichiers), regexpr("[0-9]{8}", basename(fichiers))),
+    format = "%Y%m%d"
+  )
+  
+  valides <- !is.na(dates_fichiers)
+  if (!any(valides)) return(character(0))
+  
+  fichiers       <- fichiers[valides]
+  dates_fichiers <- dates_fichiers[valides]
+  ecarts         <- abs(as.numeric(dates_fichiers - date))
+  
+  fichiers[which.min(ecarts)]
+}
+
+# Indique si une date tombe en saison seche (mai-octobre) ou humide
+est_saison_seche <- function(date) month(date) %in% 5:10
+
+# Extrait la date (format YYYYMMDD dans le nom) d'un fichier Landsat
+extraire_date_fichier <- function(nom_fichier) {
+  m <- regmatches(nom_fichier, regexpr("[0-9]{8}", nom_fichier))
+  as.Date(m, format = "%Y%m%d")
+}
+```
+
+# Fonctions de lecture Ta (INMET / Préfecture / Aéroport)
+
+## Ta INMET (13h UTC ou 1h UTC, à partir de 2019)
+
+```{r ta-inmet}
+lire_Ta_inmet <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  annee <- format(date_cible, "%Y")
+  if (as.integer(annee) < 2019) return(NA)
+  
+  # Recherche directe dans DOSSIER_INMET (pas de sous-dossier par annee)
+  fichiers <- list.files(DOSSIER_INMET,
+                         pattern = paste0("(^|[^A-Za-z0-9])", id_station, "([^A-Za-z0-9]|$).*\\.CSV$"),
+                         full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  
+  # Un seul CSV par station et par annee : on filtre en plus sur l'annee dans le nom de fichier
+  fichiers_annee <- fichiers[grepl(annee, basename(fichiers))]
+  if (length(fichiers_annee) == 0) return(NA)
+  if (length(fichiers_annee) > 1) {
+    cat("   [!] Plusieurs fichiers correspondent a", id_station, "pour", annee,
+        "-> on prend le premier :", basename(fichiers_annee[1]), "\n")
+  }
+  
+  if (as.integer(annee) >= 2025) {
+    skip_n      <- 8
+    parser_date <- function(x) ymd(trimws(x))
+  } else {
+    skip_n      <- 7
+    parser_date <- function(x) dmy(trimws(x))
+  }
+  
+  df <- tryCatch(
+    read.csv(fichiers_annee[1], sep = ";", skip = skip_n, header = TRUE, fileEncoding = "latin1"),
+    error = function(e) NULL
+  )
+  
+  if (is.null(df) || ncol(df) < 16) {
+    cat("   [!] Fichier Ta INMET illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 8) :", basename(fichiers_annee[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1] <- "date"
+  colnames(df)[2] <- "hora"
+  colnames(df)[8] <- "Ta"
+  
+  df$date     <- parser_date(df$date)
+  df$hora_num <- as.integer(trimws(gsub("[^0-9]", "", df$hora)))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$Ta[1])))
+}
+```
+
+## Ta Préfecture (10h locale ou 22h, à partir de 2021)
+
+```{r ta-pref}
+lire_Ta_pref <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  if (as.integer(format(date_cible, "%Y")) < 2021) return(NA)
+  
+  nom_fichier <- correspondance_pref[id_station]
+  if (is.na(nom_fichier)) return(NA)
+  
+  annee   <- format(date_cible, "%Y")
+  pattern <- paste0(nom_fichier, "_", annee, "\\.csv$")
+  fichiers <- list.files(DOSSIER_PREF, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  
+  # essai virgule, puis point-virgule si echec/format incorrect
+  df <- tryCatch(read.csv(fichiers[1], sep = ",", header = TRUE, fileEncoding = "UTF-8"),
+                 error = function(e) NULL)
+  if (is.null(df) || ncol(df) < 6) {
+    df <- tryCatch(read.csv(fichiers[1], sep = ";", header = TRUE, fileEncoding = "UTF-8"),
+                   error = function(e) NULL)
+  }
+  
+  if (is.null(df) || ncol(df) < 6) {
+    cat("   [!] Fichier Ta Prefecture illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 6, ni ',' ni ';') :", basename(fichiers[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1] <- "date"
+  colnames(df)[2] <- "hora"
+  colnames(df)[6] <- "Ta"
+  
+  df$date     <- as.Date(df$date)
+  df$hora_num <- as.integer(trimws(gsub("[^0-9]", "", df$hora)))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$Ta[1])))
+}
+```
+
+## Ta Aéroport (13h UTC ou 1h UTC, même logique que l'INMET)
+
+Format fichier : `meteo_horaire_station_<id>_<date_debut>_a_<date_fin>.csv`. Pas d'en-tête, séparateur virgule. Colonnes utiles : 1 = date+heure (UTC), 2 = id station, 3 = nom, 4 = lat, 5 = long, 6 = TA, 7 = RH. Le fichier couvre plusieurs années (2019-2026) -> on le lit une seule fois par station et par date/heure demandée.
+
+```{r ta-aeroport}
+lire_Ta_aeroport <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  
+  fichiers <- list.files(DOSSIER_AEROPORT,
+                         pattern = paste0("meteo_horaire_station_", id_station, "_.*\\.csv$"),
+                         full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  if (length(fichiers) > 1) {
+    cat("   [!] Plusieurs fichiers correspondent a la station Aeroport", id_station,
+        "-> on prend le premier :", basename(fichiers[1]), "\n")
+  }
+  
+  df <- tryCatch(
+    read.csv(fichiers[1], sep = ",", header = FALSE, stringsAsFactors = FALSE),
+    error = function(e) NULL
+  )
+  
+  if (is.null(df) || ncol(df) < 7) {
+    cat("   [!] Fichier Ta Aeroport illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 7) :", basename(fichiers[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1] <- "datetime"
+  colnames(df)[6] <- "Ta"
+  
+  df$datetime <- as.POSIXct(df$datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  df$date     <- as.Date(df$datetime)
+  df$hora_num <- as.integer(format(df$datetime, "%H%M"))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$Ta[1])))
+}
+```
+
+# Fonctions de lecture RH (INMET / Préfecture / Aéroport)
+
+Même logique que pour Ta.
+
+## RH INMET (13h UTC ou 1h UTC, à partir de 2019)
+
+```{r rh-inmet}
+lire_RH_inmet <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  annee <- format(date_cible, "%Y")
+  if (as.integer(annee) < 2019) return(NA)
+  
+  fichiers <- list.files(DOSSIER_INMET,
+                         pattern = paste0("(^|[^A-Za-z0-9])", id_station, "([^A-Za-z0-9]|$).*\\.CSV$"),
+                         full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  
+  fichiers_annee <- fichiers[grepl(annee, basename(fichiers))]
+  if (length(fichiers_annee) == 0) return(NA)
+  
+  if (as.integer(annee) >= 2025) {
+    skip_n      <- 8
+    parser_date <- function(x) ymd(trimws(x))
+  } else {
+    skip_n      <- 7
+    parser_date <- function(x) dmy(trimws(x))
+  }
+  
+  df <- tryCatch(
+    read.csv(fichiers_annee[1], sep = ";", skip = skip_n, header = TRUE, fileEncoding = "latin1"),
+    error = function(e) NULL
+  )
+  
+  if (is.null(df) || ncol(df) < 16) {
+    cat("   [!] Fichier RH INMET illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 16) :", basename(fichiers_annee[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1]  <- "date"
+  colnames(df)[2]  <- "hora"
+  colnames(df)[16] <- "RH"
+  
+  df$date     <- parser_date(df$date)
+  df$hora_num <- as.integer(trimws(gsub("[^0-9]", "", df$hora)))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$RH[1])))
+}
+```
+
+## RH Préfecture (10h locale ou 22h, à partir de 2021)
+
+```{r rh-pref}
+lire_RH_pref <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  if (as.integer(format(date_cible, "%Y")) < 2021) return(NA)
+  
+  nom_fichier <- correspondance_pref[id_station]
+  if (is.na(nom_fichier)) return(NA)
+  
+  annee   <- format(date_cible, "%Y")
+  pattern <- paste0(nom_fichier, "_", annee, "\\.csv$")
+  fichiers <- list.files(DOSSIER_PREF, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  
+  df <- tryCatch(read.csv(fichiers[1], sep = ",", header = TRUE, fileEncoding = "UTF-8"),
+                 error = function(e) NULL)
+  if (is.null(df) || ncol(df) < 8) {
+    df <- tryCatch(read.csv(fichiers[1], sep = ";", header = TRUE, fileEncoding = "UTF-8"),
+                   error = function(e) NULL)
+  }
+  
+  if (is.null(df) || ncol(df) < 8) {
+    cat("   [!] Fichier RH Prefecture illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 8, ni ',' ni ';') :", basename(fichiers[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1] <- "date"
+  colnames(df)[2] <- "hora"
+  colnames(df)[8] <- "RH"
+  
+  df$date     <- as.Date(df$date)
+  df$hora_num <- as.integer(trimws(gsub("[^0-9]", "", df$hora)))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$RH[1])))
+}
+```
+
+## RH Aéroport (13h UTC ou 1h UTC, même logique que l'INMET)
+
+```{r rh-aeroport}
+lire_RH_aeroport <- function(id_station, date_cible, heure_cible) {
+  if (is.na(date_cible)) return(NA)
+  
+  fichiers <- list.files(DOSSIER_AEROPORT,
+                         pattern = paste0("meteo_horaire_station_", id_station, "_.*\\.csv$"),
+                         full.names = TRUE, ignore.case = TRUE)
+  if (length(fichiers) == 0) return(NA)
+  if (length(fichiers) > 1) {
+    cat("   [!] Plusieurs fichiers correspondent a la station Aeroport", id_station,
+        "-> on prend le premier :", basename(fichiers[1]), "\n")
+  }
+  
+  df <- tryCatch(
+    read.csv(fichiers[1], sep = ",", header = FALSE, stringsAsFactors = FALSE),
+    error = function(e) NULL
+  )
+  
+  if (is.null(df) || ncol(df) < 7) {
+    cat("   [!] Fichier RH Aeroport illisible ou mal formate (", if (is.null(df)) 0 else ncol(df),
+        "colonnes au lieu de 7) :", basename(fichiers[1]), "\n")
+    return(NA)
+  }
+  
+  colnames(df)[1] <- "datetime"
+  colnames(df)[7] <- "RH"
+  
+  df$datetime <- as.POSIXct(df$datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  df$date     <- as.Date(df$datetime)
+  df$hora_num <- as.integer(format(df$datetime, "%H%M"))
+  
+  ligne <- df %>% filter(date == date_cible, hora_num == heure_cible)
+  if (nrow(ligne) == 0) return(NA)
+  
+  as.numeric(gsub(",", ".", as.character(ligne$RH[1])))
+}
+```
+
+# Extraction LST (Landsat uniquement)
+
+```{r extraction-lst}
+construire_df_lst <- function(dossier, pattern) {
+  fichiers <- list.files(dossier, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
+  cat(sprintf("LST Landsat (%s) : %d fichier(s)\n", basename(dossier), length(fichiers)))
+  
+  df_lst <- map_dfr(fichiers, function(f) {
+    date <- extraire_date_fichier(basename(f))
+    
+    if (is.na(date)) {
+      cat("   [!] Date non reconnue/invalide, fichier ignore :", basename(f), "\n")
+      return(NULL)
+    }
+    
+    cat("   ->", format(date, "%d/%m/%Y"), "\n")
+    
+    r     <- rast(f)
+    r_1km <- resample_1km(r)
+    
+    data.frame(
+      date        = date,
+      source      = df_stations$source,
+      id_station  = df_stations$id_station,
+      nom         = df_stations$nom,
+      LST_pixel   = extraire(r_1km),
+      LST_buffer  = extraire_buffer(r_1km)
+    )
+  })
+  
+  # --- Diagnostic : combien d'images ont TOUTES les stations renseignees (LST_pixel sans NA) ---
+  n_stations <- nrow(df_stations)
+  
+  diag_par_date <- df_lst %>%
+    group_by(date) %>%
+    summarise(n_valides = sum(!is.na(LST_pixel)), .groups = "drop") %>%
+    mutate(complete = n_valides == n_stations)
+  
+  cat("\n--- Diagnostic completude LST (LST_pixel renseigne pour les", n_stations, "stations) ---\n")
+  cat("Images totales :", nrow(diag_par_date),
+      "| Images completes :", sum(diag_par_date$complete), "\n\n")
+  
+  df_lst
+}
+```
+
+# Extraction ERA5 générique (Ta et RH975)
+
+`regex_date` : regex pour extraire la date depuis le nom de fichier. `format_date` : format correspondant (ex `"%d%m%y"` ou `"%Y%m%d"`). `kelvin` : `TRUE` si conversion Kelvin -> Celsius nécessaire (Ta), `FALSE` sinon (RH).
+
+```{r extraction-era5}
+extraire_ERA5_generique <- function(dossier, pattern_fichier, regex_date, format_date,
+                                    nom_colonne, kelvin) {
+  fichiers <- list.files(dossier, pattern = pattern_fichier, full.names = TRUE)
+  cat(sprintf("ERA5 [%s] : %d fichier(s) dans %s\n", nom_colonne, length(fichiers), basename(dossier)))
+  
+  map_dfr(fichiers, function(chemin) {
+    nom      <- basename(chemin)
+    date_str <- regmatches(nom, regexpr(regex_date, nom))
+    date     <- as.Date(date_str, format = format_date)
+    if (is.na(date)) { cat("   Date non parsee :", nom, "\n"); return(NULL) }
+    
+    r <- tryCatch(rast(chemin), error = function(e) { cat("   Erreur GRIB :", nom, "\n"); NULL })
+    if (is.null(r)) return(NULL)
+    
+    vals <- extraire(resample_1km(r[[1]]))
+    if (kelvin) vals <- round(vals - 273.15, 2) else vals <- round(vals, 2)
+    
+    df <- data.frame(date = date, source = df_stations$source, id_station = df_stations$id_station)
+    df[[nom_colonne]] <- vals
+    df
+  })
+}
+```
+
+# Prédicteurs statiques (calcul unique, jour = nuit)
+
+```{r pred-statiques}
+cat("\n--- Extraction des predicteurs statiques (une seule fois) ---\n")
+
+mnt_1km    <- resample_1km(CHEMIN_MNT)
+tpi_1km    <- resample_1km(CHEMIN_TPI)
+ocean_1km   <- resample_1km(CHEMIN_OCEAN)
+mer_1km   <- resample_1km(CHEMIN_MER)
+svf_1km    <- resample_1km(CHEMIN_SVF)
+lcz_1km    <- resample_1km(CHEMIN_LCZ, method = "near")  # categoriel
+slope_1km  <- resample_1km(CHEMIN_SLOPE)
+aspect_1km <- resample_1km(CHEMIN_ASPECT)  # note : variable circulaire, la moyenne bilineaire est une approximation
+
+df_pred_statiques <- df_stations %>%
+  select(source, id_station) %>%
+  mutate(
+    MNT        = extraire(mnt_1km),
+    TPI        = extraire(tpi_1km),
+    dist_ocean = combler_NA_plus_proche(extraire(ocean_1km), ocean_1km), #règle prbl station Copacabana qui tombe en NA à 1km
+    dist_mer   = combler_NA_plus_proche(extraire(mer_1km),mer_1km),
+    SVF        = extraire(svf_1km),
+    LCZ        = extraire(lcz_1km),
+    slope      = extraire(slope_1km),
+    aspect     = extraire(aspect_1km)
+  )
+
+cat("Predicteurs statiques extraits pour", nrow(df_pred_statiques), "stations.\n")
+```
+
+# Prédicteurs par date (NDVI, NDBI, MNDWI, albédo)
+
+Réutilisable pour n'importe quel ensemble de dates (jour + nuit). Si aucun raster ne correspond à une date -> NA + message (à compléter plus tard sans toucher au code : juste ajouter le fichier manquant).
+
+```{r pred-par-date}
+extraire_predicteurs_date <- function(date) {
+  f_ndvi  <- trouver_fichier_date(DOSSIER_NDVI,  date)
+  f_mndwi <- trouver_fichier_date(DOSSIER_MNDWI, date)
+  f_ndbi  <- trouver_fichier_date(DOSSIER_NDBI,  date)
+  
+  # Repli sur le fichier le plus proche si pas de correspondance exacte
+  # (cas des dates de nuit)
+  if (length(f_ndvi) == 0) {
+    f_ndvi <- trouver_fichier_proche(DOSSIER_NDVI, date)
+    if (length(f_ndvi) > 0) {
+      cat("   [i] NDVI : pas d'image exacte pour", format(date, "%d/%m/%Y"),
+          "-> utilisation de", basename(f_ndvi), "\n")
+    }
+  }
+  if (length(f_mndwi) == 0) {
+    f_mndwi <- trouver_fichier_proche(DOSSIER_MNDWI, date)
+    if (length(f_mndwi) > 0) {
+      cat("   [i] MNDWI : pas d'image exacte pour", format(date, "%d/%m/%Y"),
+          "-> utilisation de", basename(f_mndwi), "\n")
+    }
+  }
+  if (length(f_ndbi) == 0) {
+    f_ndbi <- trouver_fichier_proche(DOSSIER_NDBI, date)
+    if (length(f_ndbi) > 0) {
+      cat("   [i] NDBI : pas d'image exacte pour", format(date, "%d/%m/%Y"),
+          "-> utilisation de", basename(f_ndbi), "\n")
+    }
+  }
+  
+  albedo_1km <- resample_1km(if (est_saison_seche(date)) CHEMIN_ALBEDO_SEC else CHEMIN_ALBEDO_HUM)
+  albedo_val <- extraire(albedo_1km)
+  
+  if (length(f_ndvi) == 0 || length(f_mndwi) == 0 || length(f_ndbi) == 0) {
+    cat("   [!] Raster NDVI/MNDWI/NDBI manquant (aucune image disponible) pour",
+        format(date, "%d/%m/%Y"), "-> NA\n")
+    return(data.frame(
+      date = date, source = df_stations$source, id_station = df_stations$id_station,
+      NDVI = NA_real_, NDBI = NA_real_, MNDWI = NA_real_, albedo = albedo_val
+    ))
+  }
+  
+  data.frame(
+    date       = date,
+    source     = df_stations$source,
+    id_station = df_stations$id_station,
+    NDVI       = extraire(resample_1km(f_ndvi[1])),
+    NDBI       = extraire(resample_1km(f_ndbi[1])),
+    MNDWI      = extraire(resample_1km(f_mndwi[1])),
+    albedo     = albedo_val
+  )
+}
+```
+
+# Fonction principale : construire LST + Ta + ERA5 pour un régime (jour ou nuit)
+
+```{r fonction-principale-regime}
+construire_df_regime <- function(config) {
+  
+  cat("\n============================================================\n")
+  cat("REGIME :", toupper(config$nom_regime), "\n")
+  cat("============================================================\n")
+  
+  df_lst <- construire_df_lst(config$dossier_lst, config$pattern_lst)
+  
+  # --- Ta (INMET + Prefecture + Aeroport selon la source de chaque station) ---
+  cat("\nRecherche des Ta stations...\n")
+  df_lst$Ta <- sapply(seq_len(nrow(df_lst)), function(i) {
+    source_i     <- df_lst$source[i]
+    id_station_i <- df_lst$id_station[i]
+    date_i       <- df_lst$date[i]
+    if (source_i == "INMET") {
+      lire_Ta_inmet(id_station_i, date_i, config$heure_inmet)
+    } else if (source_i == "Aeroporto") {
+      lire_Ta_aeroport(id_station_i, date_i, config$heure_inmet)  # deja en UTC, meme heure que l'INMET
+    } else {
+      lire_Ta_pref(id_station_i, date_i, config$heure_pref)
+    }
+  })
+  cat("Ta manquantes :", sum(is.na(df_lst$Ta)), "/", nrow(df_lst), "\n")
+  
+  # --- RH station (INMET + Prefecture + Aeroport) ---
+  cat("\nRecherche des RH stations...\n")
+  df_lst$RH_station <- vapply(seq_len(nrow(df_lst)), function(i) {
+    source_i     <- df_lst$source[i]
+    id_station_i <- df_lst$id_station[i]
+    date_i       <- df_lst$date[i]
+    if (source_i == "INMET") {
+      lire_RH_inmet(id_station_i, date_i, config$heure_inmet)
+    } else if (source_i == "Aeroporto") {
+      lire_RH_aeroport(id_station_i, date_i, config$heure_inmet)
+    } else {
+      lire_RH_pref(id_station_i, date_i, config$heure_pref)
+    }
+  }, FUN.VALUE = numeric(1))
+  cat("RH manquantes :", sum(is.na(df_lst$RH_station)), "/", nrow(df_lst), "\n")
+  
+  # --- ERA5 Ta et RH975 ---
+  cat("\nExtraction ERA5...\n")
+  df_era5_ta <- extraire_ERA5_generique(
+    config$dossier_era5_ta, "^era5_t.*\\.grib$",
+    "\\d{6}", "%d%m%y", "Ta_era5", kelvin = TRUE
+  )
+  df_era5_rh <- extraire_ERA5_generique(
+    config$dossier_era5_rh, "^era5_h_.*\\.grib$",
+    "\\d{8}", "%Y%m%d", "RH975_era5", kelvin = FALSE
+  )
+  
+  df_lst %>%
+    left_join(df_era5_ta, by = c("date", "source", "id_station")) %>%
+    left_join(df_era5_rh, by = c("date", "source", "id_station"))
+}
+```
+
+# Définition des configs JOUR / NUIT et construction des DF partiels
+
+```{r configs-et-df-partiels}
+config_jour <- list(
+  nom_regime      = "jour",
+  dossier_lst     = DOSSIER_LST_JOUR_LANDSAT,
+  pattern_lst     = PATTERN_LST_JOUR_LANDSAT,
+  heure_inmet     = HEURE_INMET_JOUR,
+  heure_pref      = HEURE_PREF_JOUR,
+  dossier_era5_ta = DOSSIER_ERA5_TA_JOUR,
+  dossier_era5_rh = DOSSIER_ERA5_RH_JOUR
+)
+
+config_nuit <- list(
+  nom_regime      = "nuit",
+  dossier_lst     = DOSSIER_LST_NUIT_LANDSAT,
+  pattern_lst     = PATTERN_LST_NUIT_LANDSAT,
+  heure_inmet     = HEURE_INMET_NUIT,
+  heure_pref      = HEURE_PREF_NUIT,
+  dossier_era5_ta = DOSSIER_ERA5_TA_NUIT,
+  dossier_era5_rh = DOSSIER_ERA5_RH_NUIT
+)
+
+df_jour_partiel <- construire_df_regime(config_jour)
+df_nuit_partiel <- construire_df_regime(config_nuit)
+```
+
+# Prédicteurs par date sur l'union des dates (jour + nuit)
+
+```{r pred-dates-union}
+dates_uniques <- sort(unique(c(df_jour_partiel$date, df_nuit_partiel$date)))
+cat("\nDates uniques totales (jour + nuit) :", length(dates_uniques), "\n")
+
+df_pred_dates <- map_dfr(dates_uniques, extraire_predicteurs_date)
+```
+
+## Comblement NDVI/NDBI/MNDWI en NA par la moyenne saisonnière (par station)
+
+Pour chaque station, on calcule la moyenne des indices sur les dates où ils sont connus (Landsat), séparément pour saison sèche et saison humide, puis on applique cette moyenne aux dates où l'indice est NA.
+
+```{r comblement-indices}
+cat("\n--- Comblement des indices NDVI/NDBI/MNDWI par moyenne saisonniere (par station) ---\n")
+
+df_pred_dates <- df_pred_dates %>%
+  mutate(
+    saison = if_else(est_saison_seche(date), "seche", "humide"),
+    # Trace la provenance AVANT tout comblement : "mesure" = raster reel, "NA" temporaire = a combler
+    indices_source = if_else(is.na(NDVI) & is.na(NDBI) & is.na(MNDWI), "moyenne_saison", "mesure")
+  )
+
+moyennes_saison_station <- df_pred_dates %>%
+  filter(indices_source == "mesure") %>%
+  group_by(id_station, saison) %>%
+  summarise(
+    NDVI_moy  = mean(NDVI,  na.rm = TRUE),
+    NDBI_moy  = mean(NDBI,  na.rm = TRUE),
+    MNDWI_moy = mean(MNDWI, na.rm = TRUE),
+    n_dates_reference = n(),
+    .groups = "drop"
+  )
+
+cat("Moyennes saisonnieres calculees a partir des dates avec indices connus (par station/saison) :\n")
+print(moyennes_saison_station)
+
+n_avant <- sum(is.na(df_pred_dates$NDVI))
+
+df_pred_dates <- df_pred_dates %>%
+  left_join(moyennes_saison_station, by = c("id_station", "saison")) %>%
+  mutate(
+    NDVI  = if_else(is.na(NDVI),  NDVI_moy,  NDVI),
+    NDBI  = if_else(is.na(NDBI),  NDBI_moy,  NDBI),
+    MNDWI = if_else(is.na(MNDWI), MNDWI_moy, MNDWI)
+  ) %>%
+  select(-NDVI_moy, -NDBI_moy, -MNDWI_moy, -n_dates_reference, -saison)
+
+n_apres <- sum(is.na(df_pred_dates$NDVI))
+cat("NDVI NA avant comblement :", n_avant, "-> apres comblement :", n_apres, "\n")
+cat("Repartition source des indices :\n")
+print(table(df_pred_dates$indices_source))
+cat("\n")
+```
+
+# Assemblage final et export
+
+```{r assemblage-final}
+ordre_colonnes <- c(
+  "date", "source", "id_station", "nom", "Ta", "RH_station", "LST_pixel", "LST_buffer",
+  "Ta_era5", "RH975_era5", "MNT", "TPI", "dist_ocean", "dist_mer", "SVF", "LCZ",
+  "slope", "aspect", "NDVI", "NDBI", "MNDWI", "indices_source", "albedo",
+  "longitude", "latitude", "diff_LST_Ta"
+)
+
+assembler_df_final <- function(df_partiel) {
+  df_partiel %>%
+    left_join(df_pred_statiques, by = c("source", "id_station")) %>%
+    left_join(df_pred_dates,     by = c("date", "source", "id_station")) %>%
+    left_join(df_coords,         by = c("source", "id_station")) %>%
+    mutate(diff_LST_Ta = round(LST_buffer - Ta, 2)) %>%
+    select(all_of(ordre_colonnes)) %>%
+    arrange(date, id_station)
+}
+
+df_jour_1km <- assembler_df_final(df_jour_partiel)
+df_nuit_1km <- assembler_df_final(df_nuit_partiel)
+
+cat("\n=== DF JOUR 1km ===\n")
+cat("Lignes :", nrow(df_jour_1km), "| Colonnes :", ncol(df_jour_1km), "\n")
+cat("Repartition par source de station :\n")
+print(table(df_jour_1km$source))
+cat("Nombre de dates uniques jour :", length(unique(df_jour_1km$date)), "\n")
+
+cat("\n=== DF NUIT 1km ===\n")
+cat("Lignes :", nrow(df_nuit_1km), "| Colonnes :", ncol(df_nuit_1km), "\n")
+cat("Repartition par source de station :\n")
+print(table(df_nuit_1km$source))
+cat("Nombre de dates uniques nuit :", length(unique(df_nuit_1km$date)), "\n")
+
+write.csv(df_jour_1km, file = CHEMIN_EXPORT_JOUR, row.names = FALSE)
+write.csv(df_nuit_1km, file = CHEMIN_EXPORT_NUIT, row.names = FALSE)
+
+cat("\nExports termines :\n -", CHEMIN_EXPORT_JOUR, "\n -", CHEMIN_EXPORT_NUIT, "\n")
+```
