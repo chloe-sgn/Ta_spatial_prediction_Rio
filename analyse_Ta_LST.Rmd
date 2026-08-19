@@ -1,0 +1,273 @@
+---
+title: "Relation LST sur Ta"
+author: "Spagnoli Chloé"
+date: "2026-08-11"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+Dans un premier temps, on cherche à connaître la relation entre Ta et LST (l'effet de LST sur Ta) avec un modèle linéaire simple.
+
+Ensuite, on cherche à identifier des profils de stations plus chaudes que les autres en calculant les résidus de cette relation.
+
+Enfin, on cherche à savoir si la relation LST sur Ta change en fonction de la typologie de station (côtière, végétalisée, urbaine, en altitude).
+
+Attention : la typologie "altitude" a finalement été retirée car elle ne comportait qu'une seule station (trop peu d'observations pour le test). À ajouter si davantage de stations en altitude sont disponibles.
+
+> MODIFIER LE SCRIPT EN FONCTION DE NUIT/JOUR
+
+```{r packages}
+library(tidyverse)
+library(scales)   # pour les échelles de couleur
+library(lmerTest)
+library(ggplot2)
+```
+
+## Chargement et préparation des données
+
+```{r chargement}
+df <- read.csv("C:/Users/Spagnoli/Desktop/R/DF_nuit1k_aeroport", stringsAsFactors = FALSE)
+
+df <- df %>%
+  select(date, source, nom, Ta, LST_pixel, NDBI, NDVI, dist_mer, MNT) %>%
+  mutate(
+    date = as.Date(date),
+    nom  = as.factor(nom)
+  ) %>%
+  drop_na(Ta, LST_pixel)   # sécurité si quelques valeurs manquantes
+
+cat("Nombre d'observations :", nrow(df), "\n")
+cat("Nombre de stations :", n_distinct(df$nom), "\n")
+cat("Nombre de dates :", n_distinct(df$date), "\n")
+```
+
+## 1. Régression linéaire simple Ta ~ LST_pixel (relation globale)
+
+```{r modele-simple}
+modele <- lm(Ta ~ LST_pixel, data = df) # Ta en fonction de LST
+print(summary(modele))
+
+pente     <- coef(modele)["LST_pixel"] # inclinaison de la droite : sensibilité de Ta aux variations de LST
+intercept <- coef(modele)["(Intercept)"] # ordonnée à l'origine (le b dans y = ax + b)
+r2        <- summary(modele)$r.squared # part de variance de Ta expliquée par la LST seule
+
+cat("\n--- Résumé de la relation Ta ~ LST ---\n")
+cat(sprintf("Quand LST augmente de 1°C, Ta augmente de %.2f°C\n", pente))
+cat(sprintf("R² = %.2f (part de variance de Ta expliquée par la LST)\n", r2))
+```
+
+Graphique de contrôle : nuage de points + droite de régression, coloré par source (INMET, Prefecture, Aeroport), avec annotation du R2 sur le graphique
+
+```{r graph-modele-simple}
+r2_label <- sprintf("R² = %.2f", r2)
+
+ggplot(df, aes(x = LST_pixel, y = Ta)) +
+  geom_point(aes(color = source), alpha = 0.5, size = 1.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 0.8) +
+  scale_color_manual(
+    values = c("INMET" = "#FFA500", "Prefecture" = "#9B59B6", "Aeroporto" = "#FF69B4"),
+    name = "Source"
+  ) +
+  annotate(
+    "text",
+    x = min(df$LST_pixel, na.rm = TRUE),
+    y = max(df$Ta, na.rm = TRUE),
+    label = r2_label,
+    hjust = 0, vjust = 1, size = 5, fontface = "bold"
+  ) +
+  labs(
+    title = "Relation entre température de l'air (Ta) et LST la nuit",
+    x = "LST (°C)", y = "Ta (°C)"
+  ) +
+  theme_minimal()
+```
+
+## 2. Calcul des résidus = écart à la relation moyenne Ta ~ LST
+
+Objectif : identifier les stations où l'air est structurellement plus chaud ou plus froid que ce que prédit la LST seule. Révèle des effets locaux indépendants de la LST (intérêt d'ajouter d'autres prédicteurs par la suite pour prédire la Ta)
+
+On répond à la question : **comment varie la relation Ta ~ LST selon les stations ?**
+
+- résidu > 0 : la station est plus chaude que ce que prédit la LST ce jour-là
+- résidu < 0 : la station est plus froide que ce que prédit la LST
+
+```{r residus}
+df$Ta_predit <- predict(modele, newdata = df)
+df$residu    <- df$Ta - df$Ta_predit
+```
+
+### Effet structurel par station (moyenne des résidus sur toutes les dates)
+
+C'est l'équivalent simple de l'effet aléatoire "station" d'un modèle mixte : de combien une station est en moyenne plus chaude/froide que la normale, une fois la LST prise en compte
+
+```{r effet-station}
+effet_station <- df %>%
+  group_by(nom, source) %>%
+  summarise(
+    residu_moyen = mean(residu, na.rm = TRUE),
+    n_obs        = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(residu_moyen))
+
+print(effet_station)
+```
+
+Graphique en barres : classement des stations, des plus chaudes aux plus froides
+
+```{r graph-effet-station}
+ggplot(effet_station, aes(x = reorder(nom, residu_moyen), y = residu_moyen, fill = source)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("INMET" = "#FFA500", "Prefecture" = "#9B59B6", "Aeroporto" = "#FF69B4"),
+    name = "Source"
+  ) +
+  labs(
+    title = "Écart structurel de chaque station par rapport à la relation Ta~LST",
+    subtitle = "Résidu moyen positif = station plus chaude que prédit par la LST",
+    x = NULL, y = "Résidu moyen (°C)"
+  ) +
+  theme_minimal()
+```
+
+### Heatmap station × date des résidus
+
+On ordonne les stations de la plus chaude à la plus froide (structurellement), grâce à `effet_station`.
+
+```{r heatmap, fig.width=12, fig.height=7}
+ordre_stations <- effet_station$nom  # déjà trié desc(residu_moyen)
+
+df <- df %>%
+  mutate(
+    nom  = factor(nom, levels = rev(ordre_stations)),  # rev() pour que la plus chaude soit en haut de la heatmap
+    date = factor(date, levels = sort(unique(date)))   # date en factor : chaque date devient une catégorie / un carré
+  )
+
+heatmap_plot <- ggplot(df, aes(x = date, y = nom, fill = residu)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradient2(
+    low = "#0099FF", mid = "#FFFFCC", high = "#CC0000",
+    midpoint = 0,
+    name = "Résidu\n(°C)"
+  ) +
+  labs(
+    title = "Écart de température par station et par date (résidus Ta ~ LST)",
+    subtitle = "Rouge = plus chaud que prédit | Bleu = plus froid que prédit",
+    x = "Date", y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7)
+  )
+
+print(heatmap_plot)
+```
+
+*Exemple de lecture : Guaratiba a le plus de dates où la Ta de la station est plus chaude que celle prédite avec la LST le jour.*
+
+```{r save-heatmap}
+ggsave("heatmap_residus_Ta_LST.png", heatmap_plot, width = 12, height = 7, dpi = 300)
+```
+
+## 3. H1 — La relation Ta ~ LST varie selon la typologie des stations
+
+On calcule des valeurs moyennes (par station, tous relevés confondus) pour classer chaque station dans une catégorie fixe (côtier / végétalisé / urbain).
+
+```{r typologie}
+stations_typo <- df %>%
+  group_by(nom) %>%
+  summarise(
+    dist_mer = mean(dist_mer, na.rm = TRUE),  # distance moyenne à la mer (échelle log)
+    NDVI     = mean(NDVI, na.rm = TRUE),      # verdissement moyen
+    NDBI     = mean(NDBI, na.rm = TRUE)       # bâti moyen (non utilisé dans le seuillage ici)
+  ) %>%
+  mutate(
+    # Règles de classement appliquées dans l'ordre (case_when s'arrête à la 1ère condition vraie) :
+    typologie = case_when(
+      dist_mer < 6              ~ "côtier",      # log(dist_mer) < 6 = environ moins de 1000 m de la mer
+      NDVI > quantile(NDVI, 0.6) ~ "végétalisé",  # stations dans les 40% les plus végétalisées
+      TRUE                       ~ "urbain"       # tout le reste = urbain par défaut
+    )
+  ) %>%
+  select(nom, typologie)
+
+# Vérifier la répartition : chaque catégorie doit contenir plusieurs stations
+# (si une catégorie n'a qu'1-2 stations, le modèle sera peu fiable -> revoir le seuil ou fusionner)
+table(stations_typo$typologie)
+```
+
+```{r rattachement}
+# Rattacher la typologie (fixe) à toutes les observations de chaque station
+df <- df %>% left_join(stations_typo, by = "nom")
+
+# Centrer la LST (utile pour l'interprétation du modèle : l'intercept représente
+# la Ta moyenne pour une LST moyenne, et limite la colinéarité dans l'interaction)
+df$LST_c <- df$LST_pixel - mean(df$LST_pixel, na.rm = TRUE)
+```
+
+### Modèle mixte avec interaction LST × typologie
+
+- `(1|nom)` = effet aléatoire station : autorise chaque station à avoir son propre niveau de base de Ta
+- `LST_c * typologie` = teste si la **pente** de la relation Ta~LST diffère selon la typologie
+
+```{r modele-interaction}
+modele <- lmer(Ta ~ LST_c * typologie + (1|nom), data = df)
+summary(modele)
+```
+
+### Comparaison des modèles avec/sans interaction (test de l'hypothèse H1)
+
+Deux stations peuvent avoir la même sensibilité à la LST (même pente) mais un niveau de base différent (intercept différent) ex: une station urbaine peut être globalement plus chaude tout le temps, mais réagir de la même façon à une hausse de LST qu'une station côtière. C'est ce que teste le modèle avec interaction par rapport au modèle sans interaction.
+
+Si l'ANOVA est significative, la relation Ta~LST varie bien selon la typologie.
+
+```{r comparaison-modeles}
+modele_sans <- lmer(Ta ~ LST_c + typologie + (1|nom), data = df)
+# pentes communes, seul l'intercept varie
+# -> ce modèle dit : les 3 types de stations ont des niveaux de Ta différents,
+#    mais réagissent tous de la même manière à une hausse de LST
+
+modele_avec <- lmer(Ta ~ LST_c * typologie + (1|nom), data = df)
+# pentes ET intercepts varient
+# -> ce modèle dit : les 3 types de stations réagissent différemment à une hausse de LST
+
+anova(modele_sans, modele_avec)
+```
+
+Ce test compare si autoriser des pentes différentes (modèle avec interaction) améliore significativement l'ajustement, par rapport à des pentes communes :
+
+- **Significatif (p < 0.05)** : les pentes sont différentes selon la typologie → **H1 confirmée**, la relation Ta~LST varie selon la typologie
+- **Non significatif** : les pentes ne sont pas statistiquement différentes → on ne peut pas rejeter l'hypothèse de pentes communes → **H0 confirmée** (le modèle simple suffit)
+
+### Visualisation
+
+**Comment lire ce graphique :**
+
+- Chaque point = une observation (une station à un moment donné), coloré par typologie
+- `alpha = 0.3` : les points sont semi-transparents, les zones plus foncées indiquent plus de points superposés (concentration des données)
+- Les droites de régression (`geom_smooth`, méthode `"lm"`) résument la tendance par groupe :
+  - la **pente** de la droite = force du lien LST sur Ta pour cette typologie (plus la pente est raide, plus Ta réagit fortement à la LST)
+  - la **position verticale** de la droite = niveau moyen de Ta pour cette typologie
+- Si les 3 droites sont à peu près parallèles → pas d'interaction (pentes similaires, H1 non confirmée)
+- Si les droites divergent ou convergent = la sensibilité Ta~LST diffère selon le milieu (H1 confirmée)
+- À comparer visuellement avec l'ANOVA ci-dessus : une différence de pente visible ici doit correspondre à un résultat significatif du test `modele_sans` vs `modele_avec`
+
+```{r graph-typologie}
+ggplot(df, aes(x = LST_pixel, y = Ta, color = typologie)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +  # se = FALSE : pas de bande de confiance, pour lisibilité
+  scale_color_manual(values = c("urbain" = "#FF3333",
+                                "végétalisé" = "#00CC66",
+                                "côtier" = "#66CCFF")) +
+  theme_minimal() +
+  labs(title = "Relation LST-Ta selon la typologie urbaine la nuit",
+       x = "LST (°C)", y = "Température de l'air (°C)", color = "Typologie")
+```
